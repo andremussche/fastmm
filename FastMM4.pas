@@ -1,3 +1,7 @@
+{$Include FastMM4Options.inc}
+
+{$undef ASMVersion}
+
 (*
 
 Fast Memory Manager 4.991
@@ -846,8 +850,6 @@ unit FastMM4;
 
 interface
 
-{$Include FastMM4Options.inc}
-
 {$RANGECHECKS OFF}
 {$BOOLEVAL OFF}
 {$OVERFLOWCHECKS OFF}
@@ -1365,7 +1367,7 @@ function LogMemoryManagerStateToFile(const AFileName: string; const AAdditionalD
 const
   {The stack trace depth. (Must be an *uneven* number to ensure that the
    Align16Bytes option works in FullDebugMode.)}
-  StackTraceDepth = 11;
+  StackTraceDepth = 21;
   {The number of entries in the allocation group stack}
   AllocationGroupStackSize = 1000;
   {The number of fake VMT entries - used to track virtual method calls on
@@ -1861,13 +1863,19 @@ const
   FullDebugBlockOverhead = SizeOf(TFullDebugBlockHeader) + SizeOf(NativeUInt) + SizeOf(Pointer);
 {$endif}
 
+type
+  PSmallBlockTypesArray = ^SmallBlockTypesArray;
+  SmallBlockTypesArray = array[0..NumSmallBlockTypes - 1] of TSmallBlockType;
+
 {-------------------------Private variables----------------------------}
 var
   {-----------------Small block management------------------}
   {The small block types. Sizes include the leading header. Sizes are
    picked to limit maximum wastage to about 10% or 256 bytes (whichever is
    less) where possible.}
-  SmallBlockTypes: array[0..NumSmallBlockTypes - 1] of TSmallBlockType =(
+  SmallBlockTypesMT: array[0..7] of SmallBlockTypesArray;
+
+  SmallBlockTypes_: SmallBlockTypesArray = ( //array[0..NumSmallBlockTypes - 1] of TSmallBlockType =(
     {8/16 byte jumps}
 {$ifndef Align16Bytes}
     (BlockSize: 8 {$ifdef UseCustomFixedSizeMoveRoutines}; UpsizeMoveProcedure: Move4{$endif}),
@@ -3330,28 +3338,35 @@ end;
 {Locks all small block types}
 procedure LockAllSmallBlockTypes;
 var
-  LInd: Cardinal;
+  i, LInd: Cardinal;
+  SmallBlockTypes: PSmallBlockTypesArray;
 begin
   {Lock the medium blocks}
 {$ifndef AssumeMultiThreaded}
   if IsMultiThread then
 {$endif}
   begin
-    for LInd := 0 to NumSmallBlockTypes - 1 do
+    for i := 0 to High(SmallBlockTypesMT) do
     begin
-      while LockCmpxchg(0, 1, @SmallBlockTypes[LInd].BlockTypeLocked) <> 0 do
+      SmallBlockTypes := @SmallBlockTypesMT[i];
+
+      for LInd := 0 to NumSmallBlockTypes - 1 do
       begin
-{$ifdef NeverSleepOnThreadContention}
-  {$ifdef UseSwitchToThread}
-        SwitchToThread;
+        while LockCmpxchg(0, 1, @(SmallBlockTypes^)[LInd].BlockTypeLocked) <> 0 do
+        begin
+  {$ifdef NeverSleepOnThreadContention}
+    {$ifdef UseSwitchToThread}
+          SwitchToThread;
+    {$endif}
+  {$else}
+          Sleep(InitialSleepTime);
+          if LockCmpxchg(0, 1, @SmallBlockTypes[LInd].BlockTypeLocked) = 0 then
+            Break;
+          Sleep(AdditionalSleepTime);
   {$endif}
-{$else}
-        Sleep(InitialSleepTime);
-        if LockCmpxchg(0, 1, @SmallBlockTypes[LInd].BlockTypeLocked) = 0 then
-          Break;
-        Sleep(AdditionalSleepTime);
-{$endif}
+        end;
       end;
+
     end;
   end;
 end;
@@ -4215,52 +4230,67 @@ var
   LPMediumBin: PMediumFreeBlock;
   LBinNumber, {$ifndef FullDebugMode}LBinGroupsMasked, {$endif}LBinGroupMasked,
     LBinGroupNumber: Cardinal;
+
+  i: Integer;
+  SmallBlockTypes: PSmallBlockTypesArray;
+  bLocked: Boolean;
 begin
   {Is it a small block? -> Take the header size into account when
    determining the required block size}
   if NativeUInt(ASize) <= (MaximumSmallBlockSize - BlockHeaderSize) then
   begin
-    {-------------------------Allocate a small block---------------------------}
-    {Get the block type from the size}
-    LPSmallBlockType := PSmallBlockType(AllocSize2SmallBlockTypeIndX4[
-      (NativeUInt(ASize) + (BlockHeaderSize - 1)) div SmallBlockGranularity]
-      * (SizeOf(TSmallBlockType) div 4)
-      + UIntPtr(@SmallBlockTypes));
-    {Lock the block type}
-{$ifndef AssumeMultiThreaded}
-    if IsMultiThread then
-{$endif}
-    begin
-      while True do
+    bLocked := False;
+    while not bLocked do
+      for i := 0 to High(SmallBlockTypesMT) do
       begin
-        {Try to lock the small block type}
-        if LockCmpxchg(0, 1, @LPSmallBlockType.BlockTypeLocked) = 0 then
-          Break;
-        {Try the next block type}
-        Inc(PByte(LPSmallBlockType), SizeOf(TSmallBlockType));
-        if LockCmpxchg(0, 1, @LPSmallBlockType.BlockTypeLocked) = 0 then
-          Break;
-        {Try up to two sizes past the requested size}
-        Inc(PByte(LPSmallBlockType), SizeOf(TSmallBlockType));
-        if LockCmpxchg(0, 1, @LPSmallBlockType.BlockTypeLocked) = 0 then
-          Break;
-        {All three sizes locked - given up and sleep}
-        Dec(PByte(LPSmallBlockType), 2 * SizeOf(TSmallBlockType));
-{$ifdef NeverSleepOnThreadContention}
-  {$ifdef UseSwitchToThread}
-        SwitchToThread;
-  {$endif}
-{$else}
-        {Both this block type and the next is in use: sleep}
-        Sleep(InitialSleepTime);
-        {Try the lock again}
-        if LockCmpxchg(0, 1, @LPSmallBlockType.BlockTypeLocked) = 0 then
-          Break;
-        {Sleep longer}
-        Sleep(AdditionalSleepTime);
-{$endif}
+        SmallBlockTypes := @SmallBlockTypesMT[i];
+
+        {-------------------------Allocate a small block---------------------------}
+        {Get the block type from the size}
+        LPSmallBlockType := PSmallBlockType(AllocSize2SmallBlockTypeIndX4[
+          (NativeUInt(ASize) + (BlockHeaderSize - 1)) div SmallBlockGranularity]
+          * (SizeOf(TSmallBlockType) div 4)
+          + UIntPtr({@}SmallBlockTypes));
+        {Lock the block type}
+//    {$ifndef AssumeMultiThreaded}
+//        if IsMultiThread then
+//    {$endif}
+//        begin
+//          while True do
+//          begin
+            {Try to lock the small block type}
+            if LockCmpxchg(0, 1, @LPSmallBlockType.BlockTypeLocked) = 0 then
+            begin
+              bLocked := True;
+              Break;
+            end;
+  //          {Try the next block type}
+  //          Inc(PByte(LPSmallBlockType), SizeOf(TSmallBlockType));
+  //          if LockCmpxchg(0, 1, @LPSmallBlockType.BlockTypeLocked) = 0 then
+  //            Break;
+  //          {Try up to two sizes past the requested size}
+  //          Inc(PByte(LPSmallBlockType), SizeOf(TSmallBlockType));
+  //          if LockCmpxchg(0, 1, @LPSmallBlockType.BlockTypeLocked) = 0 then
+  //            Break;
+  //          {All three sizes locked - given up and sleep}
+  //          Dec(PByte(LPSmallBlockType), 2 * SizeOf(TSmallBlockType));
+    {$ifdef NeverSleepOnThreadContention}
+      {$ifdef UseSwitchToThread}
+            SwitchToThread;
+      {$endif}
+    {$else}
+            {Both this block type and the next is in use: sleep}
+            Sleep(InitialSleepTime);
+//            {Try the lock again}
+//            if LockCmpxchg(0, 1, @LPSmallBlockType.BlockTypeLocked) = 0 then
+//              Break;
+//            {Sleep longer}
+//            Sleep(AdditionalSleepTime);
+    {$endif}
+//          end;
+//        end;
       end;
-    end;
+
     {Get the first pool with free blocks}
     LPSmallBlockPool := LPSmallBlockType.NextPartiallyFreePool;
     {Is the pool valid?}
@@ -8903,6 +8933,11 @@ begin
 {$endif}
       {Free the actual block}
       Result := FastFreeMem(LActualBlock);
+//AM: no real free, so mem cannot be reused, for better "use after free" tests
+//AM: caution: will give out of memory very fast!
+//      {$MESSAGE WARN 'temp: no real mem free'}
+//      DebugFillMem(APointer^, LActualBlock.UserSize, DebugFillPattern);
+//      Result := 0;
       {$ifdef FullDebugModeCallBacks}
       if Assigned(OnDebugFreeMemFinish) then
         OnDebugFreeMemFinish(LActualBlock, Result);
@@ -9829,6 +9864,9 @@ var
   LPSmallBlockPool: PSmallBlockPoolHeader;
   LCurPtr, LEndPtr: Pointer;
   LInd: Integer;
+
+  i: Integer;
+  SmallBlockTypes: PSmallBlockTypesArray;
 begin
   {Lock all small block types}
   LockAllSmallBlockTypes;
@@ -9882,8 +9920,14 @@ begin
     {Unlock medium blocks}
     MediumBlocksLocked := False;
     {Unlock all the small block types}
-    for LInd := 0 to NumSmallBlockTypes - 1 do
-      SmallBlockTypes[LInd].BlockTypeLocked := False;
+
+    for i := 0 to High(SmallBlockTypesMT) do
+    begin
+      SmallBlockTypes := @SmallBlockTypesMT[i];
+
+      for LInd := 0 to NumSmallBlockTypes - 1 do
+        SmallBlockTypes[LInd].BlockTypeLocked := False;
+    end;
   end;
   {Step through all the large blocks}
   LockLargeBlocks;
@@ -10368,7 +10412,8 @@ var
     Dec(LSmallBlockSize, FullDebugBlockOverhead);
   {$endif}
     {Get the block type index}
-    LBlockTypeIndex := (UIntPtr(APSmallBlockPool.BlockType) - UIntPtr(@SmallBlockTypes[0])) div SizeOf(TSmallBlockType);
+    Exit; //todo
+//    LBlockTypeIndex := (UIntPtr(APSmallBlockPool.BlockType) - UIntPtr(@SmallBlockTypes[0])) div SizeOf(TSmallBlockType);
     LPLeakedClasses := @LSmallBlockLeaks[LBlockTypeIndex];
     {Get the first and last pointer for the pool}
     GetFirstAndLastSmallBlockInPool(APSmallBlockPool, LCurPtr, LEndPtr);
@@ -10617,7 +10662,7 @@ begin
       {Step through all the small block types}
       for LBlockTypeInd := 0 to NumSmallBlockTypes - 1 do
       begin
-        LThisBlockSize := SmallBlockTypes[LBlockTypeInd].BlockSize - BlockHeaderSize;
+        LThisBlockSize := SmallBlockTypes_[LBlockTypeInd].BlockSize - BlockHeaderSize;
   {$ifdef FullDebugMode}
         Dec(LThisBlockSize, FullDebugBlockOverhead);
         if NativeInt(LThisBlockSize) < 0 then
@@ -10782,6 +10827,9 @@ var
   LBlockTypeIndex, LMediumBlockSize: Cardinal;
   LMediumBlockHeader, LLargeBlockSize: NativeUInt;
   LPLargeBlock: PLargeBlockHeader;
+
+  i:Integer;
+  SmallBlockTypes: PSmallBlockTypesArray;
 begin
   {Clear the structure}
   FillChar(AMemoryManagerState, SizeOf(AMemoryManagerState), 0);
@@ -10789,9 +10837,9 @@ begin
   for LInd := 0 to NumSmallBlockTypes - 1 do
   begin
     AMemoryManagerState.SmallBlockTypeStates[LInd].InternalBlockSize :=
-      SmallBlockTypes[LInd].BlockSize;
+      SmallBlockTypes_[LInd].BlockSize;
     AMemoryManagerState.SmallBlockTypeStates[LInd].UseableBlockSize :=
-      SmallBlockTypes[LInd].BlockSize - BlockHeaderSize{$ifdef FullDebugMode} - FullDebugBlockOverhead{$endif};
+      SmallBlockTypes_[LInd].BlockSize - BlockHeaderSize{$ifdef FullDebugMode} - FullDebugBlockOverhead{$endif};
     if NativeInt(AMemoryManagerState.SmallBlockTypeStates[LInd].UseableBlockSize) < 0 then
       AMemoryManagerState.SmallBlockTypeStates[LInd].UseableBlockSize := 0;
   end;
@@ -10816,8 +10864,9 @@ begin
         LMediumBlockSize := LMediumBlockHeader and DropMediumAndLargeFlagsMask;
         if (LMediumBlockHeader and IsSmallBlockPoolInUseFlag) <> 0 then
         begin
+          Exit; //todo
           {Get the block type index}
-          LBlockTypeIndex := (UIntPtr(PSmallBlockPoolHeader(LPMediumBlock).BlockType) - UIntPtr(@SmallBlockTypes[0])) div SizeOf(TSmallBlockType);
+//          LBlockTypeIndex := (UIntPtr(PSmallBlockPoolHeader(LPMediumBlock).BlockType) - UIntPtr(@SmallBlockTypes[0])) div SizeOf(TSmallBlockType);
           {Subtract from medium block usage}
           Dec(AMemoryManagerState.ReservedMediumBlockAddressSpace, LMediumBlockSize);
           {Add it to the reserved space for the block size}
@@ -10843,9 +10892,15 @@ begin
   end;
   {Unlock medium blocks}
   MediumBlocksLocked := False;
+
   {Unlock all the small block types}
-  for LInd := 0 to NumSmallBlockTypes - 1 do
-    SmallBlockTypes[LInd].BlockTypeLocked := False;
+  for i := 0 to High(SmallBlockTypesMT) do
+  begin
+    SmallBlockTypes := @SmallBlockTypesMT[i];
+    for LInd := 0 to NumSmallBlockTypes - 1 do
+      SmallBlockTypes[LInd].BlockTypeLocked := False;
+  end;
+
   {Step through all the large blocks}
   LockLargeBlocks;
   LPLargeBlock := LargeBlocksCircularList.NextLargeBlockHeader;
@@ -10992,6 +11047,9 @@ var
   LSmallBlockUsage, LSmallBlockOverhead, LMediumBlockHeader, LLargeBlockSize: NativeUInt;
   LInd: Integer;
   LPLargeBlock: PLargeBlockHeader;
+
+  i: Integer;
+  SmallBlockTypes: PSmallBlockTypesArray;
 begin
   {Clear the structure}
   FillChar(Result, SizeOf(Result), 0);
@@ -11023,10 +11081,11 @@ begin
         if (LMediumBlockHeader and IsSmallBlockPoolInUseFlag) <> 0 then
         begin
           {Get the block type index}
-          LBlockTypeIndex := (UIntPtr(PSmallBlockPoolHeader(LPMediumBlock).BlockType) - UIntPtr(@SmallBlockTypes[0])) div SizeOf(TSmallBlockType);
+          Exit; //todo
+//          LBlockTypeIndex := (UIntPtr(PSmallBlockPoolHeader(LPMediumBlock).BlockType) - UIntPtr(@SmallBlockTypes[0])) div SizeOf(TSmallBlockType);
           {Get the usage in the block}
           LSmallBlockUsage := PSmallBlockPoolHeader(LPMediumBlock).BlocksInUse
-            * SmallBlockTypes[LBlockTypeIndex].BlockSize;
+            * SmallBlockTypes_[LBlockTypeIndex].BlockSize;
           {Get the total overhead for all the small blocks}
           LSmallBlockOverhead := PSmallBlockPoolHeader(LPMediumBlock).BlocksInUse
               * (BlockHeaderSize{$ifdef FullDebugMode} + FullDebugBlockOverhead{$endif});
@@ -11061,9 +11120,15 @@ begin
   Inc(Result.Unused, MediumSequentialFeedBytesLeft);
   {Unlock the medium blocks}
   MediumBlocksLocked := False;
+
   {Unlock all the small block types}
-  for LInd := 0 to NumSmallBlockTypes - 1 do
-    SmallBlockTypes[LInd].BlockTypeLocked := False;
+  for i := 0 to High(SmallBlockTypesMT) do
+  begin
+    SmallBlockTypes := @SmallBlockTypesMT[i];
+    for LInd := 0 to NumSmallBlockTypes - 1 do
+      SmallBlockTypes[LInd].BlockTypeLocked := False;
+  end;
+
   {Step through all the large blocks}
   LockLargeBlocks;
   LPLargeBlock := LargeBlocksCircularList.NextLargeBlockHeader;
@@ -11091,6 +11156,9 @@ var
   LPMediumFreeBlock: PMediumFreeBlock;
   LPLargeBlock, LPNextLargeBlock: PLargeBlockHeader;
   LInd: Integer;
+
+  i: Integer;
+  SmallBlockTypes: PSmallBlockTypesArray;
 begin
   {Free all block pools}
   LPMediumBlockPoolHeader := MediumBlockPoolsCircularList.NextMediumBlockPoolHeader;
@@ -11110,14 +11178,20 @@ begin
     {Next pool}
     LPMediumBlockPoolHeader := LPNextMediumBlockPoolHeader;
   end;
-  {Clear all small block types}
-  for LInd := 0 to High(SmallBlockTypes) do
+
+  for i := 0 to High(SmallBlockTypesMT) do
   begin
-    SmallBlockTypes[Lind].PreviousPartiallyFreePool := @SmallBlockTypes[Lind];
-    SmallBlockTypes[Lind].NextPartiallyFreePool := @SmallBlockTypes[Lind];
-    SmallBlockTypes[Lind].NextSequentialFeedBlockAddress := Pointer(1);
-    SmallBlockTypes[Lind].MaxSequentialFeedBlockAddress := nil;
+    SmallBlockTypes := @SmallBlockTypesMT[i];
+    {Clear all small block types}
+    for LInd := 0 to High(SmallBlockTypes^) do
+    begin
+      SmallBlockTypes[Lind].PreviousPartiallyFreePool := @SmallBlockTypes[Lind];
+      SmallBlockTypes[Lind].NextPartiallyFreePool := @SmallBlockTypes[Lind];
+      SmallBlockTypes[Lind].NextSequentialFeedBlockAddress := Pointer(1);
+      SmallBlockTypes[Lind].MaxSequentialFeedBlockAddress := nil;
+    end;
   end;
+
   {Clear all medium block pools}
   MediumBlockPoolsCircularList.PreviousMediumBlockPoolHeader := @MediumBlockPoolsCircularList;
   MediumBlockPoolsCircularList.NextMediumBlockPoolHeader := @MediumBlockPoolsCircularList;
@@ -11230,6 +11304,9 @@ var
   LInd, LSizeInd, LMinimumPoolSize, LOptimalPoolSize, LGroupNumber,
     LBlocksPerPool, LPreviousBlockSize: Cardinal;
   LPMediumFreeBlock: PMediumFreeBlock;
+
+  i: Integer;
+  SmallBlockTypes: PSmallBlockTypesArray;
 begin
 {$ifdef FullDebugMode}
   {$ifdef LoadDebugDLLDynamically}
@@ -11250,80 +11327,92 @@ begin
 {$endif}
   {Initialize the memory manager}
   {-------------Set up the small block types-------------}
-  LPreviousBlockSize := 0;
-  for LInd := 0 to High(SmallBlockTypes) do
+  for i := 0 to High(SmallBlockTypesMT) do
   begin
-    {Set the move procedure}
-{$ifdef UseCustomFixedSizeMoveRoutines}
-    {The upsize move procedure may move chunks in 16 bytes even with 8-byte
-    alignment, since the new size will always be at least 8 bytes bigger than
-    the old size.}
-    if not Assigned(SmallBlockTypes[LInd].UpsizeMoveProcedure) then
-  {$ifdef UseCustomVariableSizeMoveRoutines}
-      SmallBlockTypes[LInd].UpsizeMoveProcedure := MoveX16LP;
-  {$else}
-      SmallBlockTypes[LInd].UpsizeMoveProcedure := @System.Move;
-  {$endif}
-{$endif}
-    {Set the first "available pool" to the block type itself, so that the
-     allocation routines know that there are currently no pools with free
-     blocks of this size.}
-    SmallBlockTypes[LInd].PreviousPartiallyFreePool := @SmallBlockTypes[LInd];
-    SmallBlockTypes[LInd].NextPartiallyFreePool := @SmallBlockTypes[LInd];
-    {Set the block size to block type index translation table}
-    for LSizeInd := (LPreviousBlockSize div SmallBlockGranularity) to ((SmallBlockTypes[LInd].BlockSize - 1) div SmallBlockGranularity) do
-      AllocSize2SmallBlockTypeIndX4[LSizeInd] := LInd * 4;
-    {Cannot sequential feed yet: Ensure that the next address is greater than
-     the maximum address}
-    SmallBlockTypes[LInd].MaxSequentialFeedBlockAddress := Pointer(0);
-    SmallBlockTypes[LInd].NextSequentialFeedBlockAddress := Pointer(1);
-    {Get the mask to use for finding a medium block suitable for a block pool}
-    LMinimumPoolSize :=
-      ((SmallBlockTypes[LInd].BlockSize * MinimumSmallBlocksPerPool
-        + SmallBlockPoolHeaderSize + MediumBlockGranularity - 1 - MediumBlockSizeOffset)
-      and -MediumBlockGranularity) + MediumBlockSizeOffset;
-    if LMinimumPoolSize < MinimumMediumBlockSize then
-      LMinimumPoolSize := MinimumMediumBlockSize;
-    {Get the closest group number for the minimum pool size}
-    LGroupNumber := (LMinimumPoolSize - MinimumMediumBlockSize + MediumBlockBinsPerGroup * MediumBlockGranularity div 2)
-      div (MediumBlockBinsPerGroup * MediumBlockGranularity);
-    {Too large?}
-    if LGroupNumber > 7 then
-      LGroupNumber := 7;
-    {Set the bitmap}
-    SmallBlockTypes[LInd].AllowedGroupsForBlockPoolBitmap := Byte(-(1 shl LGroupNumber));
-    {Set the minimum pool size}
-    SmallBlockTypes[LInd].MinimumBlockPoolSize := MinimumMediumBlockSize + LGroupNumber * (MediumBlockBinsPerGroup * MediumBlockGranularity);
-    {Get the optimal block pool size}
-    LOptimalPoolSize := ((SmallBlockTypes[LInd].BlockSize * TargetSmallBlocksPerPool
-        + SmallBlockPoolHeaderSize + MediumBlockGranularity - 1 - MediumBlockSizeOffset)
-      and -MediumBlockGranularity) + MediumBlockSizeOffset;
-    {Limit the optimal pool size to within range}
-    if LOptimalPoolSize < OptimalSmallBlockPoolSizeLowerLimit then
-      LOptimalPoolSize := OptimalSmallBlockPoolSizeLowerLimit;
-    if LOptimalPoolSize > OptimalSmallBlockPoolSizeUpperLimit then
-      LOptimalPoolSize := OptimalSmallBlockPoolSizeUpperLimit;
-    {How many blocks will fit in the adjusted optimal size?}
-    LBlocksPerPool := (LOptimalPoolSize - SmallBlockPoolHeaderSize) div SmallBlockTypes[LInd].BlockSize;
-    {Recalculate the optimal pool size to minimize wastage due to a partial
-     last block.}
-    SmallBlockTypes[LInd].OptimalBlockPoolSize :=
-      ((LBlocksPerPool * SmallBlockTypes[LInd].BlockSize + SmallBlockPoolHeaderSize + MediumBlockGranularity - 1 - MediumBlockSizeOffset) and -MediumBlockGranularity) + MediumBlockSizeOffset;
-{$ifdef CheckHeapForCorruption}
-    {Debug checks}
-    if (SmallBlockTypes[LInd].OptimalBlockPoolSize < MinimumMediumBlockSize)
-      or (SmallBlockTypes[LInd].BlockSize div SmallBlockGranularity * SmallBlockGranularity <> SmallBlockTypes[LInd].BlockSize) then
+    //copy defined constants
+    SmallBlockTypes := @SmallBlockTypesMT[i];
+    for LInd := 0 to High(SmallBlockTypes^) do
     begin
-  {$ifdef BCB6OrDelphi7AndUp}
-      System.Error(reInvalidPtr);
-  {$else}
-      System.RunError(reInvalidPtr);
-  {$endif}
+      SmallBlockTypes[LInd].BlockSize := SmallBlockTypes_[LInd].BlockSize;
+      SmallBlockTypes[LInd].UpsizeMoveProcedure := SmallBlockTypes_[LInd].UpsizeMoveProcedure;
     end;
-{$endif}
-    {Set the previous small block size}
-    LPreviousBlockSize := SmallBlockTypes[LInd].BlockSize;
+
+    LPreviousBlockSize := 0;
+    for LInd := 0 to High(SmallBlockTypes^) do
+    begin
+      {Set the move procedure}
+  {$ifdef UseCustomFixedSizeMoveRoutines}
+      {The upsize move procedure may move chunks in 16 bytes even with 8-byte
+      alignment, since the new size will always be at least 8 bytes bigger than
+      the old size.}
+      if not Assigned(SmallBlockTypes[LInd].UpsizeMoveProcedure) then
+    {$ifdef UseCustomVariableSizeMoveRoutines}
+        SmallBlockTypes[LInd].UpsizeMoveProcedure := MoveX16LP;
+    {$else}
+        SmallBlockTypes[LInd].UpsizeMoveProcedure := @System.Move;
+    {$endif}
+  {$endif}
+      {Set the first "available pool" to the block type itself, so that the
+       allocation routines know that there are currently no pools with free
+       blocks of this size.}
+      SmallBlockTypes[LInd].PreviousPartiallyFreePool := @SmallBlockTypes[LInd];
+      SmallBlockTypes[LInd].NextPartiallyFreePool := @SmallBlockTypes[LInd];
+      {Set the block size to block type index translation table}
+      for LSizeInd := (LPreviousBlockSize div SmallBlockGranularity) to ((SmallBlockTypes[LInd].BlockSize - 1) div SmallBlockGranularity) do
+        AllocSize2SmallBlockTypeIndX4[LSizeInd] := LInd * 4;
+      {Cannot sequential feed yet: Ensure that the next address is greater than
+       the maximum address}
+      SmallBlockTypes[LInd].MaxSequentialFeedBlockAddress := Pointer(0);
+      SmallBlockTypes[LInd].NextSequentialFeedBlockAddress := Pointer(1);
+      {Get the mask to use for finding a medium block suitable for a block pool}
+      LMinimumPoolSize :=
+        ((SmallBlockTypes[LInd].BlockSize * MinimumSmallBlocksPerPool
+          + SmallBlockPoolHeaderSize + MediumBlockGranularity - 1 - MediumBlockSizeOffset)
+        and -MediumBlockGranularity) + MediumBlockSizeOffset;
+      if LMinimumPoolSize < MinimumMediumBlockSize then
+        LMinimumPoolSize := MinimumMediumBlockSize;
+      {Get the closest group number for the minimum pool size}
+      LGroupNumber := (LMinimumPoolSize - MinimumMediumBlockSize + MediumBlockBinsPerGroup * MediumBlockGranularity div 2)
+        div (MediumBlockBinsPerGroup * MediumBlockGranularity);
+      {Too large?}
+      if LGroupNumber > 7 then
+        LGroupNumber := 7;
+      {Set the bitmap}
+      SmallBlockTypes[LInd].AllowedGroupsForBlockPoolBitmap := Byte(-(1 shl LGroupNumber));
+      {Set the minimum pool size}
+      SmallBlockTypes[LInd].MinimumBlockPoolSize := MinimumMediumBlockSize + LGroupNumber * (MediumBlockBinsPerGroup * MediumBlockGranularity);
+      {Get the optimal block pool size}
+      LOptimalPoolSize := ((SmallBlockTypes[LInd].BlockSize * TargetSmallBlocksPerPool
+          + SmallBlockPoolHeaderSize + MediumBlockGranularity - 1 - MediumBlockSizeOffset)
+        and -MediumBlockGranularity) + MediumBlockSizeOffset;
+      {Limit the optimal pool size to within range}
+      if LOptimalPoolSize < OptimalSmallBlockPoolSizeLowerLimit then
+        LOptimalPoolSize := OptimalSmallBlockPoolSizeLowerLimit;
+      if LOptimalPoolSize > OptimalSmallBlockPoolSizeUpperLimit then
+        LOptimalPoolSize := OptimalSmallBlockPoolSizeUpperLimit;
+      {How many blocks will fit in the adjusted optimal size?}
+      LBlocksPerPool := (LOptimalPoolSize - SmallBlockPoolHeaderSize) div SmallBlockTypes[LInd].BlockSize;
+      {Recalculate the optimal pool size to minimize wastage due to a partial
+       last block.}
+      SmallBlockTypes[LInd].OptimalBlockPoolSize :=
+        ((LBlocksPerPool * SmallBlockTypes[LInd].BlockSize + SmallBlockPoolHeaderSize + MediumBlockGranularity - 1 - MediumBlockSizeOffset) and -MediumBlockGranularity) + MediumBlockSizeOffset;
+  {$ifdef CheckHeapForCorruption}
+      {Debug checks}
+      if (SmallBlockTypes[LInd].OptimalBlockPoolSize < MinimumMediumBlockSize)
+        or (SmallBlockTypes[LInd].BlockSize div SmallBlockGranularity * SmallBlockGranularity <> SmallBlockTypes[LInd].BlockSize) then
+      begin
+    {$ifdef BCB6OrDelphi7AndUp}
+        System.Error(reInvalidPtr);
+    {$else}
+        System.RunError(reInvalidPtr);
+    {$endif}
+      end;
+  {$endif}
+      {Set the previous small block size}
+      LPreviousBlockSize := SmallBlockTypes[LInd].BlockSize;
+    end;
   end;
+
   {-------------------Set up the medium blocks-------------------}
 {$ifdef CheckHeapForCorruption}
   {Check that there are no gaps between where the small blocks end and the
